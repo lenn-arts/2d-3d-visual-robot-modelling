@@ -1,0 +1,22 @@
+expname = robots3_test15_f17_n2f6_N32_False
+basedir = ./logs
+datadir = ./data/nerf_robot_3
+dataset_type = blender
+
+no_batching = True
+
+N_samples = 32
+N_importance = 64
+
+use_viewdirs = True
+
+white_bkgd = False
+
+N_rand = 1024
+
+half_res = False
+i_print=20
+i_img=100
+i_video=2000
+i_weights= 500
+N_iters = 10000
