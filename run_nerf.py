@@ -1,5 +1,5 @@
 import os
-os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'false' # manually deactivated
 
 import sys
 import tensorflow as tf
@@ -12,11 +12,22 @@ from run_nerf_helpers import *
 from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
+from numba import cuda
+import gc
 
+gc.enable()
+gc.collect()
 
+###os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 tf.compat.v1.enable_eager_execution()
+#tf.keras.backend.clear_session() # MANUAL
+#cuda.get_current_device()
+#cuda.close()
+#device = cuda.get_current_device()
+#device.reset()
 
-
+# called by: run_network()
+# calls: fn-> 
 def batchify(fn, chunk):
     """Constructs a version of 'fn' that applies to smaller batches."""
     if chunk is None:
@@ -26,26 +37,50 @@ def batchify(fn, chunk):
         return tf.concat([fn(inputs[i:i+chunk]) for i in range(0, inputs.shape[0], chunk)], 0)
     return ret
 
+# EXP: main forward pass of the network
+# called by: network_query_fn()
+# calls: embed_fn->; batchify()
+def run_network(inputs, viewdirs, joint_angles, fn, embed_fn, embeddirs_fn, embedjoints_fn, netchunk=1024*64):
+    """Prepares inputs and applies network 'fn'.
+        args:
+        joint_angles: [N_rays_of_batch(N_rand) X num_joints]"""
 
-def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
-    """Prepares inputs and applies network 'fn'."""
-
-    inputs_flat = tf.reshape(inputs, [-1, inputs.shape[-1]])
-
-    embedded = embed_fn(inputs_flat)
+    ###print("run_network > inputs.shape", inputs.shape)
+    inputs_flat = tf.reshape(inputs, [-1, inputs.shape[-1]]) # (N_rays_of_batch*N_points_on_ray) X 3   # 65536 X 3
+    
+    ###print("run_network > inputs_flat.shape", inputs_flat.shape)
+    embedded = embed_fn(inputs_flat) # from 3 coordinates per point to 63 # (N_rays_of_batch*N_points_on_ray) X 63
+    ###print("run_network > embedded.shape", embedded.shape)
     if viewdirs is not None:
         input_dirs = tf.broadcast_to(viewdirs[:, None], inputs.shape)
         input_dirs_flat = tf.reshape(input_dirs, [-1, input_dirs.shape[-1]])
         embedded_dirs = embeddirs_fn(input_dirs_flat)
-        embedded = tf.concat([embedded, embedded_dirs], -1)
+        embedded = tf.concat([embedded, embedded_dirs], -1) # (N_rays_of_batch*N_points_on_ray) X (90)
+        ###print("run_network > embedded.shape after tf.concat([embedded, embedded_dirs], -1)", embedded.shape)
+
+    # NEW 2023-03-28
+    #joint_angles = tf.broadcast_to(joint_angles[:, None, None], inputs.shape[0:2]+[1]) # insert 2nd and 3rd dimension and broadcast to N_rays_of_batch X N_points_on_ray X 1
+    ###print("run_network > joint_angles.shape", joint_angles.shape)
+    joint_angles = tf.broadcast_to(joint_angles[:, None, :], (joint_angles.shape[0],inputs.shape[1],joint_angles.shape[-1])) # insert 2nd dimension and broadcast to N_rays_of_batch X N_points_on_ray* X num_joints
+    joing_angles_flat = tf.reshape(joint_angles, [-1, joint_angles.shape[-1]]) # reshape to (N_rays_of_batch*N_points_on_ray) X num_joints
+    ###print("run_network > joint_angles.shape", joint_angles.shape)
+    joing_angles_flat = tf.cast(joing_angles_flat, tf.float32)
+    ###print("run_network > joing_angles_flat.shape", joing_angles_flat.shape)
+    embedded_joint_angles = embedjoints_fn(joing_angles_flat)
+    ###print("run_network > joint_angles_flat_embed.shape", embedded_joint_angles.shape)
+
+    embedded = tf.concat([embedded, embedded_joint_angles], -1)  # [embedded_inputs, embedded_views, embedded_angles]
+    ###print("run_network > embedded.shape after tf.concat([embedded, joint_angles_flat], -1)", embedded.shape)
 
     outputs_flat = batchify(fn, netchunk)(embedded)
     outputs = tf.reshape(outputs_flat, list(
         inputs.shape[:-1]) + [outputs_flat.shape[-1]])
     return outputs
 
-
+### called by: batchify_rays()
+### calls: network_query_fn()
 def render_rays(ray_batch,
+                joint_angles,
                 network_fn,
                 network_query_fn,
                 N_samples,
@@ -60,29 +95,29 @@ def render_rays(ray_batch,
     """Volumetric rendering.
 
     Args:
-      ray_batch: array of shape [batch_size, ...]. All information necessary
+      ray_batch:  array of shape [batch_size, ...]. All information necessary
         for sampling along a ray, including: ray origin, ray direction, min
         dist, max dist, and unit-magnitude viewing direction.
-      network_fn: function. Model for predicting RGB and density at each point
+      network_fn:  function. Model for predicting RGB and density at each point
         in space.
-      network_query_fn: function used for passing queries to network_fn.
-      N_samples: int. Number of different times to sample along each ray.
-      retraw: bool. If True, include model's raw, unprocessed predictions.
-      lindisp: bool. If True, sample linearly in inverse depth rather than in depth.
-      perturb: float, 0 or 1. If non-zero, each ray is sampled at stratified
+      network_query_fn:  function used for passing queries to network_fn.
+      N_samples:  int. Number of different times to sample along each ray.
+      retraw:  bool. If True, include model's raw, unprocessed predictions.
+      lindisp:  bool. If True, sample linearly in inverse depth rather than in depth.
+      perturb:  float, 0 or 1. If non-zero, each ray is sampled at stratified
         random points in time.
-      N_importance: int. Number of additional times to sample along each ray.
+      N_importance:  int. Number of additional times to sample along each ray.
         These samples are only passed to network_fine.
-      network_fine: "fine" network with same spec as network_fn.
-      white_bkgd: bool. If True, assume a white background.
-      raw_noise_std: ...
-      verbose: bool. If True, print more debugging info.
+      network_fine:  "fine" network with same spec as network_fn.
+      white_bkgd:  bool. If True, assume a white background.
+      raw_noise_std:  ...
+      verbose:  bool. If True, print more debugging info.
 
     Returns:
       rgb_map: [num_rays, 3]. Estimated RGB color of a ray. Comes from fine model.
       disp_map: [num_rays]. Disparity map. 1 / depth.
       acc_map: [num_rays]. Accumulated opacity along each ray. Comes from fine model.
-      raw: [num_rays, num_samples, 4]. Raw predictions from model.
+      raw: [num_rays, num_samples, 4]. Raw predictions from model. -> as in: for each point (=sample) 4 values are predicted (alpha + RGB)
       rgb0: See rgb_map. Output for coarse model.
       disp0: See disp_map. Output for coarse model.
       acc0: See acc_map. Output for coarse model.
@@ -94,7 +129,7 @@ def render_rays(ray_batch,
         """Transforms model's predictions to semantically meaningful values.
 
         Args:
-          raw: [num_rays, num_samples along ray, 4]. Prediction from model.
+          raw: [num_rays, num_samples along ray, 4]. Prediction from model. -> se above
           z_vals: [num_rays, num_samples along ray]. Integration time.
           rays_d: [num_rays, 3]. Direction of each ray.
 
@@ -107,11 +142,11 @@ def render_rays(ray_batch,
         """
         # Function for computing density from model prediction. This value is
         # strictly between [0, 1].
-        def raw2alpha(raw, dists, act_fn=tf.nn.relu): return 1.0 - \
-            tf.exp(-act_fn(raw) * dists)
+        def raw2alpha(raw, dists, act_fn=tf.nn.relu): 
+            return 1.0 - tf.exp(-act_fn(raw) * dists) # relu to cut negative values; also see formula for quadrature in paper
 
         # Compute 'distance' (in time) between each integration time along a ray.
-        dists = z_vals[..., 1:] - z_vals[..., :-1]
+        dists = z_vals[..., 1:] - z_vals[..., :-1] # last n-1 values - first n-1 values
 
         # The 'distance' from the last integration time is infinity.
         dists = tf.concat(
@@ -123,7 +158,7 @@ def render_rays(ray_batch,
         dists = dists * tf.linalg.norm(rays_d[..., None, :], axis=-1)
 
         # Extract RGB of each sample position along each ray.
-        rgb = tf.math.sigmoid(raw[..., :3])  # [N_rays, N_samples, 3]
+        rgb = tf.math.sigmoid(raw[..., :3])  # [N_rays, N_samples, 3] # sigmoid to bring into range (0.0,1.0)
 
         # Add noise to model's predictions for density. Can be used to 
         # regularize network during training (prevents floater artifacts).
@@ -133,20 +168,19 @@ def render_rays(ray_batch,
 
         # Predict density of each sample along each ray. Higher values imply
         # higher likelihood of being absorbed at this point.
-        alpha = raw2alpha(raw[..., 3] + noise, dists)  # [N_rays, N_samples]
+        alpha = raw2alpha(raw[..., 3] + noise, dists)  # based on (4th-output + noise) and distances # [N_rays, N_samples]
 
         # Compute weight for RGB of each sample along each ray.  A cumprod() is
         # used to express the idea of the ray not having reflected up to this
         # sample yet.
         # [N_rays, N_samples]
-        weights = alpha * \
-            tf.math.cumprod(1.-alpha + 1e-10, axis=-1, exclusive=True)
+        weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, axis=-1, exclusive=True) #tf.math.cumprod([a, b, c]) = [a, a * b, a * b * c]
 
-        # Computed weighted color of each sample along each ray.
+        # Computed weighted color of each sample along each ray. -> done as weighted sum of sampled points' rgb values
         rgb_map = tf.reduce_sum(
             weights[..., None] * rgb, axis=-2)  # [N_rays, 3]
 
-        # Estimated depth map is expected distance.
+        # Estimated depth map is expected distance. -> expected distance that the ray travels before reaching a barrier?
         depth_map = tf.reduce_sum(weights * z_vals, axis=-1)
 
         # Disparity map is inverse depth.
@@ -166,13 +200,13 @@ def render_rays(ray_batch,
     # batch size
     N_rays = ray_batch.shape[0]
 
-    # Extract ray origin, direction.
+    # Extract ray origin, direction from ray_batch. (first 6)
     rays_o, rays_d = ray_batch[:, 0:3], ray_batch[:, 3:6]  # [N_rays, 3] each
 
-    # Extract unit-normalized viewing direction.
-    viewdirs = ray_batch[:, -3:] if ray_batch.shape[-1] > 8 else None
+    # Extract unit-normalized viewing direction from ray_batch. (last 3)
+    viewdirs = ray_batch[:, -3:] if ray_batch.shape[-1] > 8 else None # [N_rays, 3]  # not (but almost) the same as rays_d
 
-    # Extract lower, upper bound for ray distance.
+    # Extract lower, upper bound for ray distance. (7,8)
     bounds = tf.reshape(ray_batch[..., 6:8], [-1, 1, 2])
     near, far = bounds[..., 0], bounds[..., 1]  # [-1,1]
 
@@ -186,7 +220,7 @@ def render_rays(ray_batch,
     else:
         # Sample linearly in inverse depth (disparity).
         z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
-    z_vals = tf.broadcast_to(z_vals, [N_rays, N_samples])
+    z_vals = tf.broadcast_to(z_vals, [N_rays, N_samples]) # [N_rays, N_samples]
 
     # Perturb sampling time along each ray.
     if perturb > 0.:
@@ -201,9 +235,14 @@ def render_rays(ray_batch,
     # Points in space to evaluate model at.
     pts = rays_o[..., None, :] + rays_d[..., None, :] * \
         z_vals[..., :, None]  # [N_rays, N_samples, 3]
+    print("render_rays > ray_batch.shape", ray_batch.shape)
+    print("render_rays > pts.shape", pts.shape)
+    print("render_rays > joint_angles.shape", joint_angles.shape)
 
+    # EXP: MAIN CALL TO NETWORK!
     # Evaluate model at each point.
-    raw = network_query_fn(pts, viewdirs, network_fn)  # [N_rays, N_samples, 4]
+    #raw = network_query_fn(pts, viewdirs, network_fn)  # [N_rays, N_samples, 4]
+    raw = network_query_fn(pts, viewdirs, joint_angles, network_fn)
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
         raw, z_vals, rays_d)
 
@@ -222,13 +261,15 @@ def render_rays(ray_batch,
         pts = rays_o[..., None, :] + rays_d[..., None, :] * \
             z_vals[..., :, None]  # [N_rays, N_samples + N_importance, 3]
 
+        # EXP: MAIN CALL TO NETWORK! 2
         # Make predictions with network_fine.
         run_fn = network_fn if network_fine is None else network_fine
-        raw = network_query_fn(pts, viewdirs, run_fn)
+        raw = network_query_fn(pts, viewdirs, joint_angles, run_fn)
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
             raw, z_vals, rays_d)
 
-    ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map}
+    # return object
+    ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map} 
     if retraw:
         ret['raw'] = raw
     if N_importance > 0:
@@ -242,12 +283,15 @@ def render_rays(ray_batch,
 
     return ret
 
-
-def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
+### called by: render()
+### calls: render_rays()
+def batchify_rays(rays_flat, joint_angles, chunk=1024*32, **kwargs):
     """Render rays in smaller minibatches to avoid OOM."""
     all_ret = {}
+    print("batchify_rays > rays_flat.shape", rays_flat.shape)
+    print("batchify_rays > joint_angles.shape", joint_angles.shape)
     for i in range(0, rays_flat.shape[0], chunk):
-        ret = render_rays(rays_flat[i:i+chunk], **kwargs)
+        ret = render_rays(rays_flat[i:i+chunk], joint_angles[i:i+chunk], **kwargs)
         for k in ret:
             if k not in all_ret:
                 all_ret[k] = []
@@ -256,15 +300,18 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     all_ret = {k: tf.concat(all_ret[k], 0) for k in all_ret}
     return all_ret
 
-
+### called by: render_path(), train()>update routine, and train()>log image
+### calls: get_rays(), batchify_rays()
 def render(H, W, focal,
-           chunk=1024*32, rays=None, c2w=None, ndc=True,
+           chunk=1024*32, rays=None, joint_angles=None, c2w=None, ndc=True,
            near=0., far=1.,
            use_viewdirs=False, c2w_staticcam=None,
            **kwargs):
     """Render rays
 
     Args:
+      joint_angles: either of shape [N_poses_of_batch*H*W, num_joints] when rays are given and c2w is not (direct call from train) 
+                    OR of shape [N_poses, num_joints] when c2w is given and rays are not (indirect from train via render_path())
       H: int. Height of image in pixels.
       W: int. Width of image in pixels.
       focal: float. Focal length of pinhole camera.
@@ -290,6 +337,10 @@ def render(H, W, focal,
     if c2w is not None:
         # special case to render full image
         rays_o, rays_d = get_rays(H, W, focal, c2w)
+        print("render > rays_o.shape, rays_d.shape", rays_o.shape, rays_d.shape)
+        print("render > joint_angles.shape", joint_angles.shape)
+        joint_angles = get_joint_angles_per_ray(joint_angles,W=W,H=H)
+        print("render > after batchify: joint_angles.shape", joint_angles.shape)
     else:
         # use provided ray batch
         rays_o, rays_d = rays
@@ -318,14 +369,15 @@ def render(H, W, focal,
     near, far = near * \
         tf.ones_like(rays_d[..., :1]), far * tf.ones_like(rays_d[..., :1])
 
-    # (ray origin, ray direction, min dist, max dist) for each ray
+    # (ray origin, ray direction, min dist, max dist) for each ray -> this goes into render_rays() !
     rays = tf.concat([rays_o, rays_d, near, far], axis=-1)
     if use_viewdirs:
         # (ray origin, ray direction, min dist, max dist, normalized viewing direction)
         rays = tf.concat([rays, viewdirs], axis=-1)
 
     # Render and reshape
-    all_ret = batchify_rays(rays, chunk, **kwargs)
+    print("render > rays.shape", rays.shape)
+    all_ret = batchify_rays(rays, joint_angles, chunk, **kwargs)
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = tf.reshape(all_ret[k], k_sh)
@@ -335,8 +387,8 @@ def render(H, W, focal,
     ret_dict = {k: all_ret[k] for k in all_ret if k not in k_extract}
     return ret_list + [ret_dict]
 
-
-def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0):
+# mostly used for test/val image rendering, not for trianing
+def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0, joint_angles=None):
 
     H, W, focal = hwf
 
@@ -354,7 +406,7 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
         print(i, time.time() - t)
         t = time.time()
         rgb, disp, acc, _ = render(
-            H, W, focal, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
+            H, W, focal, joint_angles=np.array([joint_angles[i]]), chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
         rgbs.append(rgb.numpy())
         disps.append(disp.numpy())
         if i == 0:
@@ -374,7 +426,8 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
 
     return rgbs, disps
 
-
+# EXP: creates the model (fine and coarse), embed_fn, the train and test render arguments, the gradient variables
+# called_by: train()
 def create_nerf(args):
     """Instantiate NeRF's MLP model."""
 
@@ -385,12 +438,20 @@ def create_nerf(args):
     if args.use_viewdirs:
         embeddirs_fn, input_ch_views = get_embedder(
             args.multires_views, args.i_embed)
+
+
+    # NEW 2023-04-04
+    ##input_ch_joint_angles = 1
+    embedjoints_fn, input_ch_joint_angles = get_embedder(
+            args.multires_joints, args.i_embed, input_dim=args.num_joints)
+
     output_ch = 4
     skips = [4]
     model = init_nerf_model(
         D=args.netdepth, W=args.netwidth,
         input_ch=input_ch, output_ch=output_ch, skips=skips,
-        input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
+        input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs,
+        input_ch_joint_angles=input_ch_joint_angles)
     grad_vars = model.trainable_variables
     models = {'model': model}
 
@@ -399,14 +460,19 @@ def create_nerf(args):
         model_fine = init_nerf_model(
             D=args.netdepth_fine, W=args.netwidth_fine,
             input_ch=input_ch, output_ch=output_ch, skips=skips,
-            input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
+            input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs,
+            input_ch_joint_angles=input_ch_joint_angles)
         grad_vars += model_fine.trainable_variables
         models['model_fine'] = model_fine
 
-    def network_query_fn(inputs, viewdirs, network_fn): return run_network(
-        inputs, viewdirs, network_fn,
+    ### calls run_network
+    ### called by render_rays>raw2output
+    ### args: inputs are 3d points to evaluate (occupancy+color), viewdirs are directions of rays (vectors) to eval. color , network_fn is function-arg in run_network
+    def network_query_fn(inputs, viewdirs, angles, network_fn): return run_network(
+        inputs, viewdirs, angles, network_fn,
         embed_fn=embed_fn,
         embeddirs_fn=embeddirs_fn,
+        embedjoints_fn=embedjoints_fn,
         netchunk=args.netchunk)
 
     render_kwargs_train = {
@@ -427,6 +493,7 @@ def create_nerf(args):
         render_kwargs_train['ndc'] = False
         render_kwargs_train['lindisp'] = args.lindisp
 
+    # render args for test/val images are almost same as for train
     render_kwargs_test = {
         k: render_kwargs_train[k] for k in render_kwargs_train}
     render_kwargs_test['perturb'] = False
@@ -515,13 +582,21 @@ def config_parser():
     parser.add_argument("--perturb", type=float, default=1.,
                         help='set to 0. for no jitter, 1. for jitter')
     parser.add_argument("--use_viewdirs", action='store_true',
-                        help='use full 5D input instead of 3D')
+                        help='use full 5D input instead of 3D (EXP: use direction of viewing as predictor for color OR just predict color like occupancy from position only)')
     parser.add_argument("--i_embed", type=int, default=0,
                         help='set 0 for default positional encoding, -1 for none')
     parser.add_argument("--multires", type=int, default=10,
                         help='log2 of max freq for positional encoding (3D location)')
     parser.add_argument("--multires_views", type=int, default=4,
                         help='log2 of max freq for positional encoding (2D direction)')
+    # NEW 2023-04-10
+    parser.add_argument("--multires_joints", type=int, default=10,
+                        help='log2 of max freq for positional encoding of joint angles (1 angle = 1 float)')
+    parser.add_argument("--num_joints", type=int, default=1,
+                        help='Will be overridden later by automatic inference of the number of joints from input transforms.json')
+    parser.add_argument("--remap_base_angle", type=int, default=1,
+                        help="use base joint angle to rotate the c2w transform matrix")
+    
     parser.add_argument("--raw_noise_std", type=float, default=0.,
                         help='std dev of noise added to regularize sigma_a output, 1e0 recommended')
 
@@ -574,6 +649,26 @@ def config_parser():
 
     return parser
 
+def get_joint_angles_per_ray(joint_angles_per_pose, rays=None, no_imgs=0, W=None, H=None, keep_dims=False):
+    """ given rays or img dimensions, transform joint angles per pose to joint angle per ray (each image has H*W rays)
+        ARGS::
+        joint_angles:   [N_imgs X num_joints]   (even for N_imgs=1)
+        rays:           [(N_imgs*H*W) X ro+rd+rgb (3) X 3]
+        RETURN::
+        joint_angle_per_ray:    [[(N_imgs*H*W) X num_joints] OR [H X W X num_joints]"""
+    if (no_imgs > 0) and (rays is not None):
+        joint_angle_per_ray = np.repeat(joint_angles_per_pose, rays.shape[0]/no_imgs, axis=0)
+    elif (W is not None) and (H is not None):
+        if keep_dims is False:
+            joint_angle_per_ray = np.repeat(joint_angles_per_pose, W*H, axis=0)
+        else:
+            joint_angles_per_pose = joint_angles_per_pose[:, np.newaxis, np.newaxis, ...]
+            joint_angle_per_ray = np.repeat(joint_angles_per_pose, H, axis=1)
+            joint_angle_per_ray = np.repeat(joint_angle_per_ray, W, axis=2)
+            joint_angle_per_ray = np.squeeze(joint_angle_per_ray, axis=0)
+    else:
+        raise Exception("too little args to compute joint_angles_per_ray")
+    return joint_angle_per_ray
 
 def train():
 
@@ -586,7 +681,6 @@ def train():
         tf.compat.v1.set_random_seed(args.random_seed)
 
     # 1) Load data
-
     if args.dataset_type == 'llff':
         images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
                                                                   recenter=True, bd_factor=.75,
@@ -616,23 +710,28 @@ def train():
         print('NEAR FAR', near, far)
 
     elif args.dataset_type == 'blender':
-        images, poses, render_poses, hwf, i_split = load_blender_data(
-            args.datadir, args.half_res, args.testskip)
-        print('Loaded blender', images.shape,
+        # poses are all my poses (train, val, test)
+        # render_poses are artificially generated poses 
+        args.remap_base_angle = True if args.remap_base_angle == 1 else False
+        images, poses, render_poses, hwf, i_split, joint_angles, render_joint_angles = load_blender_data(
+            args.datadir, args.half_res, args.testskip, return_angles = True, remap_base=args.remap_base_angle)
+        print('train > Loaded blender', images.shape,
               render_poses.shape, hwf, args.datadir)
+        print("train > joint_angles", joint_angles.shape, joint_angles[:10])
+        args.num_joints = joint_angles.shape[-1]
         i_train, i_val, i_test = i_split
+        # i_train etc are arrays of indices used to select from all poses to retrieve train set, val set etc
 
-        near = 2.#0.1#2.#0.5#2#0.1#2.
+        near = 0.1#0.1#2.#0.5#2#0.1#2.
         far = 6.#3.#6.#2.5#6#99#6.
-        print("NEAR, FAR", near, far)
+        print("******* NEAR, FAR:", near, far, "*******")
 
-        if args.white_bkgd:
+        if args.white_bkgd: 
             images = images[..., :3]*images[..., -1:] + (1.-images[..., -1:])
         else:
             images = images[..., :3]
 
     elif args.dataset_type == 'deepvoxels':
-
         images, poses, render_poses, hwf, i_split = load_dv_data(scene=args.shape,
                                                                  basedir=args.datadir,
                                                                  testskip=args.testskip)
@@ -649,17 +748,19 @@ def train():
         print('Unknown dataset type', args.dataset_type, 'exiting')
         return
 
+    if args.render_test: ### render user-given test poses if set to true (instead of generated ones)
+        render_poses = np.array(poses[i_test])
+        render_joint_angles = np.array(joint_angles[i_test])
+
     # 2) Cast intrinsics to right types
     H, W, focal = hwf
-    focal = 17#61.7#64#13.#1.#5.#20.#10. #10 #64 #48 #154.51 #85.333 #39 #10 #64
+    focal = 555.55#300.0#278.0#153.0#150.0 #best so far: 300 #others: 17#61.7#64#13.#1.#5.#20.#10. #10 #64 #48 #154.51 #85.333 #39 #10 #64  # <------
+    print(f"******* LRATE: {args.lrate} *******")
     print(f"******* FOCAL: {focal} *******")
     print(f"******* HEIGHT: {H} *******")
     print(f"******* WIDTH: {W} *******")
     H, W = int(H), int(W)
     hwf = [H, W, focal]
-
-    if args.render_test:
-        render_poses = np.array(poses[i_test])
 
     # 3) Create log dir and copy the config file
     basedir = args.basedir
@@ -676,23 +777,23 @@ def train():
             file.write(open(args.config, 'r').read())
 
     # 4) Create nerf model
-    render_kwargs_train, render_kwargs_test, start, grad_vars, models = create_nerf(
-        args)
+    render_kwargs_train, render_kwargs_test, start, grad_vars, models = create_nerf(args)
+    # render arguments for train set, and test render, start?, variables for which to compute gradients, [coarse model, fine model]
 
-    bds_dict = {
+    bds_dict = { # boundaries
         'near': tf.cast(near, tf.float32),
         'far': tf.cast(far, tf.float32),
     }
     render_kwargs_train.update(bds_dict)
     render_kwargs_test.update(bds_dict)
 
-    # Short circuit if only rendering out from trained model
+    # Short circuit if only rendering test images/videos out from trained model
     if args.render_only:
         print('RENDER ONLY')
-        if args.render_test:
+        if args.render_test: # use user-given test poses (this is actually set above)
             # render_test switches to test poses
             images = images[i_test]
-        else:
+        else: # use artificially generated poses
             # Default is smoother render_poses path
             images = None
 
@@ -702,10 +803,11 @@ def train():
         print('test poses shape', render_poses.shape)
 
         rgbs, _ = render_path(render_poses, hwf, args.chunk, render_kwargs_test,
-                              gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
+                              gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor, 
+                              joint_angles=render_joint_angles)
         print('Done rendering', testsavedir)
         imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'),
-                         to8b(rgbs), fps=30, quality=8)
+                         to8b(rgbs), fps=10, quality=8)
 
         return
 
@@ -726,33 +828,49 @@ def train():
     if use_batching:
         # For random ray batching.
         #
-        # Constructs an array 'rays_rgb' of shape [N*H*W, 3, 3] where axis=1 is
+        # Constructs an array 'rays_rgb' of shape [N*H*W, 3, 3] (N total number of images) where axis=1 is
         # interpreted as,
         #   axis=0: ray origin in world space
         #   axis=1: ray direction in world space
         #   axis=2: observed RGB color of pixel
-        print('get rays')
-        # get_rays_np() returns rays_origin=[H, W, 3], rays_direction=[H, W, 3]
-        # for each pixel in the image. This stack() adds a new dimension.
-        rays = [get_rays_np(H, W, focal, p) for p in poses[:, :3, :4]]
-        rays = np.stack(rays, axis=0)  # [N, ro+rd, H, W, 3]
-        print('done, concats')
-        # [N, ro+rd+rgb, H, W, 3]
-        rays_rgb = np.concatenate([rays, images[:, None, ...]], 1)
-        # [N, H, W, ro+rd+rgb, 3]
+        print('train > get rays (get_rays_np())')
+        # get_rays_np() returns rays_origin=[H, W, 3], rays_direction=[H, W, 3] (where 3=(x,y,z)?) for each pixel in the image = [2, H, W, 3].
+        # This stack() adds a new dimension.
+        rays = [get_rays_np(H, W, focal, p) for p in poses[:, :3, :4]] # list of (list of rays for pose) for all poses
+        rays = np.stack(rays, axis=0)  # [N, ro+rd (2), H, W, 3]
+        print('train > rays.shape', rays.shape)
+        print('train > done, concats')
+        # concatenate rays with rgb value at the pixel the ray corresponds to
+        # [N, ro+rd+rgb, H, W, 3] ->
+        rays_rgb = np.concatenate([rays, images[:, None, ...]], 1) 
+        # [N, H, W, ro+rd+rgb, 3] -> 
         rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])
+        print('train > rays_rgb.shape', rays_rgb.shape) 
+        # [N_train, H, W, ro+rd+rgb, 3] -> 
         rays_rgb = np.stack([rays_rgb[i]
                              for i in i_train], axis=0)  # train images only
-        # [(N-1)*H*W, ro+rd+rgb, 3]
+        print('train > rays_rgb.shape', rays_rgb.shape)                
+        # [N_train*H*W, ro+rd+rgb (3), 3] -> this merges rays from different images in 0-th dimension -> 
         rays_rgb = np.reshape(rays_rgb, [-1, 3, 3])
         rays_rgb = rays_rgb.astype(np.float32)
-        print('shuffle rays')
-        np.random.shuffle(rays_rgb)
-        print('done')
+        print('train > rays_rgb.shape', rays_rgb.shape)
+        pose_indices_per_ray = np.repeat(np.array(i_train), rays_rgb.shape[0]/len(i_train))
+        joint_angle_per_ray = get_joint_angles_per_ray(joint_angles, rays=rays_rgb, no_imgs=len(i_train))
+        ###joint_angle_per_ray = np.repeat(joint_angles, rays_rgb.shape[0]/len(i_train))
+        print('train > pose_indices_per_ray.shape', pose_indices_per_ray.shape, pose_indices_per_ray[159998:160004])
+        print('train > shuffle rays')
+        rng = np.random.default_rng()
+        shuffled_indexes = rng.permutation(rays_rgb.shape[0])
+        print("train > shuffle", shuffled_indexes[:5], pose_indices_per_ray[:5], joint_angle_per_ray[:5])
+        rays_rgb = rays_rgb[shuffled_indexes]
+        pose_indices_per_ray = pose_indices_per_ray[shuffled_indexes]
+        joint_angle_per_ray = joint_angle_per_ray[shuffled_indexes]
+        print("train > shuffle", shuffled_indexes[:5], pose_indices_per_ray[:5], joint_angle_per_ray[:5])
+        print('train > done')
         i_batch = 0
 
     N_iters = 1000000
-    print('Begin')
+    print('train() > Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
     print('VAL views are', i_val)
@@ -762,33 +880,41 @@ def train():
         os.path.join(basedir, 'summaries', expname))
     writer.set_as_default()
 
+    # 7) training
     for i in range(start, N_iters):
         time0 = time.time()
 
         # Sample random ray batch
 
         if use_batching:
-            # Random over all images
-            batch = rays_rgb[i_batch:i_batch+N_rand]  # [B, 2+1, 3*?]
-            batch = tf.transpose(batch, [1, 0, 2])
+            # Random rays from all (training?) images
+            # this selects from rays_rgb in the first dimension and keeps the others
+            batch = rays_rgb[i_batch:i_batch+N_rand]  # [B, 2+1, 3*?] # randomly (via prior shuffle) select N_rand different train images
+            batch = tf.transpose(batch, [1, 0, 2]) # [ro+rd+rgb, batch*H*W, 3]
+
+            batch_joint_angles = joint_angle_per_ray[i_batch:i_batch+N_rand] # [N_rand, 1]
 
             # batch_rays[i, n, xyz] = ray origin or direction, example_id, 3D position
             # target_s[n, rgb] = example_id, observed color.
-            batch_rays, target_s = batch[:2], batch[2]
+            batch_rays, target_s = batch[:2], batch[2] # [ro+rd, batch*H*W, 3] + [rgb, batch*H*W, 3]
 
             i_batch += N_rand
-            if i_batch >= rays_rgb.shape[0]:
+            if i_batch >= rays_rgb.shape[0]: # wrap around
                 np.random.shuffle(rays_rgb)
                 i_batch = 0
 
         else:
-            # Random from one image
+            # Random from one image of the training set
             img_i = np.random.choice(i_train)
             target = images[img_i]
             pose = poses[img_i, :3, :4]
+            batch_joint_angles = get_joint_angles_per_ray(joint_angles[img_i][np.newaxis,...], H=H, W=W, keep_dims=True)
+            print("batch_joint_angles.shape", batch_joint_angles.shape)
 
             if N_rand is not None:
-                rays_o, rays_d = get_rays(H, W, focal, pose)
+                rays_o, rays_d = get_rays(H, W, focal, pose) # [H, W, 3], [H, W, 3]
+                #batch_joint_angles = get_joint_angles_per_ray(joint_angles[img_i], rays=rays_o+rays_d, no_imgs=1)
+                
                 if i < args.precrop_iters:
                     dH = int(H//2 * args.precrop_frac)
                     dW = int(W//2 * args.precrop_frac)
@@ -803,10 +929,14 @@ def train():
                         tf.range(H), tf.range(W), indexing='ij'), -1)
                 coords = tf.reshape(coords, [-1, 2])
                 select_inds = np.random.choice(
-                    coords.shape[0], size=[N_rand], replace=False)
-                select_inds = tf.gather_nd(coords, select_inds[:, tf.newaxis])
-                rays_o = tf.gather_nd(rays_o, select_inds)
+                    coords.shape[0], size=[N_rand], replace=False) # select N_rand pixels/rays from select train img
+                select_inds = tf.gather_nd(coords, select_inds[:, tf.newaxis]) # [N_batch, x+y(2)]
+                print("rays_o.shape", rays_o.shape)
+                rays_o = tf.gather_nd(rays_o, select_inds) # [N_batch, 3]
+                print("rays_o.shape", rays_o.shape)
                 rays_d = tf.gather_nd(rays_d, select_inds)
+                print("batch_joint_angles.shape, select_inds.shape", batch_joint_angles.shape, select_inds.shape, select_inds[:5])
+                batch_joint_angles = tf.gather_nd(batch_joint_angles, select_inds) # TODO: verify whether this works
                 batch_rays = tf.stack([rays_o, rays_d], 0)
                 target_s = tf.gather_nd(target, select_inds)
 
@@ -814,9 +944,9 @@ def train():
 
         with tf.GradientTape() as tape:
 
-            # Make predictions for color, disparity, accumulated opacity.
+            # Make NN predictions for color, disparity, accumulated opacity.
             rgb, disp, acc, extras = render(
-                H, W, focal, chunk=args.chunk, rays=batch_rays,
+                H, W, focal, joint_angles=batch_joint_angles, chunk=args.chunk, rays=batch_rays,
                 verbose=i < 10, retraw=True, **render_kwargs_train)
 
             # Compute MSE loss between predicted and true RGB.
@@ -838,7 +968,7 @@ def train():
 
         #####           end            #####
 
-        # 7) Rest is logging
+        # 8) Rest is logging
 
         def save_weights(net, prefix, i):
             path = os.path.join(
@@ -850,45 +980,47 @@ def train():
             for k in models:
                 save_weights(models[k], k, i)
 
-        ### EXP: render test image and save it
+        ### EXP: render 2 train images turing training and save them
         ### CHANGED: added this block to record images
         if i%args.i_img==0 and i > 0:
             print("SHAPE: ", render_poses.shape)
             print("SHAPE new: ", render_poses[0,:,:].shape)
             imgbase = os.path.join(basedir, f"{expname}")#, '{}_spiral_{:06d}_.png'.format(expname, i))
             #rgb, disp = render_path(render_poses[0:2, :, :], hwf, args.chunk, render_kwargs_test, render_factor=1, savedir=imgbase)
-            rgb, disp = render_path(poses[0:2, :, :], hwf, args.chunk, render_kwargs_test, render_factor=1, savedir=imgbase)
+            rgb, disp = render_path(poses[0:2, :, :], hwf, args.chunk, render_kwargs_test, 
+                                    joint_angles=joint_angles[0:2,:], render_factor=1, savedir=imgbase)
 
-        if i % args.i_video == 0 and i > 0:
-
+        if i % args.i_video == 0 and i > 0:   #### save video from generate poses
             rgbs, disps = render_path(
-                render_poses, hwf, args.chunk, render_kwargs_test)
+                render_poses, hwf, args.chunk, render_kwargs_test, joint_angles=render_joint_angles)
             print('Done, saving', rgbs.shape, disps.shape)
             moviebase = os.path.join(
                 basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
             imageio.mimwrite(moviebase + 'rgb.mp4',
-                             to8b(rgbs), fps=30, quality=8)
+                             to8b(rgbs), fps=10, quality=8)
             imageio.mimwrite(moviebase + 'disp.mp4',
-                             to8b(disps / np.max(disps)), fps=30, quality=8)
+                             to8b(disps / np.max(disps)), fps=10, quality=8)
 
             if args.use_viewdirs:
                 render_kwargs_test['c2w_staticcam'] = render_poses[0][:3, :4]
-                rgbs_still, _ = render_path(
-                    render_poses, hwf, args.chunk, render_kwargs_test)
+                rgbs_still, disps_still = render_path(
+                    render_poses, hwf, args.chunk, render_kwargs_test, joint_angles=render_joint_angles)
                 render_kwargs_test['c2w_staticcam'] = None
                 imageio.mimwrite(moviebase + 'rgb_still.mp4',
-                                 to8b(rgbs_still), fps=30, quality=8)
+                                 to8b(rgbs_still), fps=10, quality=8)
+                imageio.mimwrite(moviebase + 'disp_still.mp4',
+                             to8b(disps_still / np.max(disps_still)), fps=10, quality=8)
 
-        if i % args.i_testset == 0 and i > 0:
+        if i % args.i_testset == 0 and i > 0:  ### render given testset poses?
             testsavedir = os.path.join(
                 basedir, expname, 'testset_{:06d}'.format(i))
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
             render_path(poses[i_test], hwf, args.chunk, render_kwargs_test,
-                        gt_imgs=images[i_test], savedir=testsavedir)
+                        gt_imgs=images[i_test], savedir=testsavedir, joint_angles=joint_angles[i_test])
             print('Saved test set')
 
-        if i % args.i_print == 0 or i < 10:
+        if i % args.i_print == 0 or i < 10:  ### print updates to console
 
             print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
             print('iter time {:.05f}'.format(dt))
@@ -899,15 +1031,26 @@ def train():
                 if args.N_importance > 0:
                     tf.contrib.summary.scalar('psnr0', psnr0)
 
-            if i % args.i_img == 0:
+            if i % args.i_img == 0:  ### save image
 
                 # Log a rendered validation view to Tensorboard
                 img_i = np.random.choice(i_val)  ### RANDOM VALIDATION IMAGE
                 target = images[img_i]
-                pose = poses[img_i, :3, :4]
-
-                rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
-                                                **render_kwargs_test)
+                pose = poses[img_i, :3, :4] # pose of validation image
+                # new 2023-04-04
+                min_angle, max_angle =  -1.0, 1.0#-2.9, 2.9
+                #val_joint_angle = np.array([0.0]*args.num_joints) #random.sample(range(int(min_angle*100),int(max_angle*100)+1),k=1)/100.0
+                # a) custom val joint angles
+                val_joint_angle = np.array([0.0, 
+                                            np.random.uniform(low=min_angle, high=max_angle),
+                                            np.random.uniform(low=min_angle, high=max_angle)]) # for 3 joints
+                # b) original joint angles
+                val_joint_angle = joint_angles[img_i]
+                print("train > val_joint_angle", val_joint_angle.shape)
+                if val_joint_angle.ndim < 2: val_joint_angle = np.reshape(val_joint_angle, (1, val_joint_angle.shape[-1]))
+                print("train > val_joint_angle after", val_joint_angle.shape)
+                rgb, disp, acc, extras = render(H, W, focal, joint_angles=val_joint_angle, chunk=args.chunk, c2w=pose,
+                                                **render_kwargs_test) # render pose
 
                 psnr = mse2psnr(img2mse(rgb, target))
                 
@@ -915,7 +1058,7 @@ def train():
                 testimgdir = os.path.join(basedir, expname, 'tboard_val_imgs')
                 if i==0:
                     os.makedirs(testimgdir, exist_ok=True)
-                imageio.imwrite(os.path.join(testimgdir, '{:06d}.png'.format(i)), to8b(rgb))
+                imageio.imwrite(os.path.join(testimgdir, '{:06d}_j{}_a{}.png'.format(i,img_i, np.round(val_joint_angle,2))), to8b(rgb))
 
                 with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
 
